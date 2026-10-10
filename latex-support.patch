@@ -1,0 +1,1394 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,4 +6,8 @@
+ zotero-cmd.json
+ .DS_Store
+ .env
+-.scaffold+.scaffold
++# Local LaTeX verification artifacts
++local-tests/build/
++local-tests/runtime/
++local-tests/*.log
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,39 @@
+ # Better Notes for Zotero
++
++## Local LaTeX formula support
++
++This local variant is based on Better Notes v3.3.3. Its separate add-on ID is
++`Knowledge4Zotero-latex@local.example`; do not enable it alongside upstream Better
++Notes, since both use the same editor integration and preferences. Upstream
++updates must be merged and rebuilt manually.
++
++In the normal rich-text note editor, pasting plain text supports `\(...\)` and
++`\[...\]`, plus `equation`, `equation*`, `align`, `align*`, `gather`, `gather*` and
++`displaymath` environments. Enable Better Notes' enhanced Markdown paste (on by
++default). Existing dollar-delimited Markdown math remains supported. The same
++conversion is available when importing Markdown or using Markdown source mode.
++
++Typing a closing `\)`, `\]`, or supported `\end{...}` in a paragraph converts the
++completed formula into a native Zotero formula. Display formulas may span normal
++paragraph breaks. A new paragraph after the formula lets you continue typing.
++Code blocks, inline code, links and unfinished formulas are left literal.
++
++HTML clipboard input preserves surrounding formatting and converts formulas
++contained within a single text node. Formula delimiters split across styled HTML
++nodes are not yet supported; paste plain text in that case. Existing notes are
++not scanned or rewritten automatically.
++
++`align` and `gather` are rendered using KaTeX's `aligned` and `gathered`
++environments. Document-level labels and numbering controls in these LaTeX math
++environments are removed on conversion. This is formula support, not a complete
++LaTeX document compiler: macro packages, custom command definitions and cross
++references are not resolved. The original source should be kept in Overleaf when
++those document features matter.
++
++Build: `npm ci && npm run build`. Tests: `npm ci --prefix local-tests`, then
++`node --test local-tests/latex.test.mjs`. The integration harness in `local-tests/`
++uses an isolated Zotero profile and data directory, not the normal library.
++
+ 
+ [![zotero target version](https://img.shields.io/badge/Zotero-8%2F9-green?style=flat-square&logo=zotero&logoColor=CC2936)](https://www.zotero.org)
+ [![Using Zotero Plugin Template](https://img.shields.io/badge/Using-Zotero%20Plugin%20Template-blue?style=flat-square&logo=github)](https://github.com/windingwind/zotero-plugin-template)
+--- a/package.json
++++ b/package.json
+@@ -1,10 +1,10 @@
+ {
+   "name": "zotero-better-notes",
+-  "version": "3.3.3",
++  "version": "3.3.3-latex.1",
+   "description": "Everything about note management. All in Zotero.",
+   "config": {
+-    "addonName": "Better Notes for Zotero",
+-    "addonID": "Knowledge4Zotero@windingwind.com",
++    "addonName": "Better Notes for Zotero (LaTeX)",
++    "addonID": "Knowledge4Zotero-latex@local.example",
+     "addonRef": "BetterNotes",
+     "prefsPrefix": "extensions.zotero.Knowledge4Zotero",
+     "addonInstance": "BetterNotes",
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "zotero-better-notes",
+-  "version": "3.3.3",
++  "version": "3.3.3-latex.1",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "zotero-better-notes",
+-      "version": "3.3.3",
++      "version": "3.3.3-latex.1",
+       "license": "AGPL-3.0-or-later",
+       "dependencies": {
+         "@codemirror/commands": "^6.10.4",
+--- a/addon/manifest.json
++++ b/addon/manifest.json
+@@ -12,9 +12,9 @@
+   "applications": {
+     "zotero": {
+       "id": "__addonID__",
+-      "update_url": "__updateURL__",
+       "strict_min_version": "8.0-beta.21",
+-      "strict_max_version": "10.99.99"
++      "strict_max_version": "10.99.99",
++      "update_url": "__updateURL__"
+     }
+   }
+ }
+--- a/src/extras/convert.ts
++++ b/src/extras/convert.ts
+@@ -20,6 +20,7 @@
+ import { visit } from "unist-util-visit";
+ import { visitParents } from "unist-util-visit-parents";
+ import { h } from "hastscript";
++import { normalizeLatexMath } from "./shared/latexMath";
+ 
+ import { Nodes, Root as HRoot, RootContent } from "hast";
+ import { ListItem, Root as MRoot, Table } from "mdast";
+@@ -433,6 +434,7 @@
+   .use(remarkParse);
+ 
+ function md2remark(str: string) {
++  str = normalizeLatexMath(str);
+   // Parse Obsidian-style image ![[xxx.png]]
+   // Encode spaces in link, otherwise it cannot be parsed to image node
+   str = str
+--- a/src/extras/editorScript.ts
++++ b/src/extras/editorScript.ts
+@@ -8,6 +8,7 @@
+   Attrs,
+   DOMParser,
+   Schema,
++  Slice,
+ } from "prosemirror-model";
+ import { EditorState, TextSelection } from "prosemirror-state";
+ import { EditorView } from "prosemirror-view";
+@@ -27,7 +28,27 @@
+     fragment.appendChild(domNode.firstChild);
+   }
+   if (slice) {
+-    return DOMParser.fromSchema(schema).parseSlice(fragment);
++    const parsed = DOMParser.fromSchema(schema).parseSlice(fragment);
++    // parseSlice opens text-containing math atoms at the slice edges. Inserting
++    // such a slice into an empty paragraph unwraps the formula into raw text.
++    // Keep normal paragraph/list paste fitting, but never open through math.
++    const capOpenDepth = (start: boolean, maximum: number) => {
++      let node = start ? parsed.content.firstChild : parsed.content.lastChild;
++      for (let depth = 0; node && depth < maximum; depth++) {
++        if (
++          node.type.name === "math_inline" ||
++          node.type.name === "math_display"
++        )
++          return depth;
++        node = start ? node.firstChild : node.lastChild;
++      }
++      return maximum;
++    };
++    return new Slice(
++      parsed.content,
++      capOpenDepth(true, parsed.openStart),
++      capOpenDepth(false, parsed.openEnd),
++    );
+   } else {
+     return DOMParser.fromSchema(schema).parse(fragment);
+   }
+--- a/src/extras/editor/plugins.ts
++++ b/src/extras/editor/plugins.ts
+@@ -5,6 +5,7 @@
+ // Use custom column resizing plugin, since the original one breaks
+ import { columnResizing } from "./columnResizing";
+ import { initNodeViews } from "./nodeViews";
++import { initLatexInputPlugin } from "./latexInput";
+ 
+ export { initPlugins };
+ 
+@@ -33,6 +34,7 @@
+   if (options.linkPreview.previewType !== "disable")
+     plugins = initLinkPreviewPlugin(plugins, options.linkPreview);
+   if (options.markdownPaste.enable) plugins = initMarkdownPastePlugin(plugins);
++  plugins = initLatexInputPlugin(plugins);
+   if (options.taskList.enable) plugins = initTaskListPlugin(plugins);
+   plugins = initMagicKeyPlugin(plugins, options.magicKey);
+   // Collect all plugins and reconfigure the state only once
+--- a/src/extras/editor/markdownPaste.ts
++++ b/src/extras/editor/markdownPaste.ts
+@@ -1,5 +1,6 @@
+ import { Plugin, PluginKey } from "prosemirror-state";
+ import { md2html } from "../convert";
++import { convertLatexHTML, findLatexMath } from "../shared/latexMath";
+ 
+ export { initMarkdownPastePlugin, MarkdownPasteOptions };
+ 
+@@ -130,11 +131,12 @@
+       return false;
+     }
+ 
+-    return html;
++    return convertLatexHTML(html, new DOMParser());
+   }
+ 
+   const text = clipboardData.getData("text/plain");
+   if (text) {
++    if (findLatexMath(text).length) return text;
+     // Match markdown patterns
+     const markdownPatterns = [
+       /^#/m, // Headers: Lines starting with #
+--- /dev/null
++++ b/src/extras/editor/latexInput.ts
+@@ -0,0 +1,104 @@
++import { Plugin, PluginKey, TextSelection } from "prosemirror-state";
++import type { EditorView } from "prosemirror-view";
++import { findLatexMath } from "../shared/latexMath";
++
++/** Convert a completed LaTeX formula in the same transaction as its closing key. */
++export function handleLatexInput(
++  view: EditorView,
++  from: number,
++  to: number,
++  text: string,
++) {
++  if (view.composing || !/[)\]}]$/.test(text)) return false;
++  const { state } = view;
++  const $from = state.doc.resolve(from);
++  const $to = state.doc.resolve(to);
++  if (!$from.sameParent($to) || $from.parent.type.name !== "paragraph")
++    return false;
++  if (
++    (state.storedMarks || $from.marks()).some(
++      (mark) => mark.type.name === "code" || mark.type.name === "link",
++    )
++  )
++    return false;
++  // A one-character placeholder keeps document positions aligned across inline atoms.
++  const leafText = (node: any) =>
++    node.type.name === "hardBreak" ? "\n" : "\ufffc";
++  let prefix =
++    $from.parent.textBetween(0, $from.parentOffset, "\n", leafText) + text;
++  const parts = [
++    { pos: $from.before(), node: $from.parent, length: prefix.length },
++  ];
++  // Display environments often span paragraphs when Enter is used in a note.
++  let previous = $from.before();
++  while (prefix.length < 50000) {
++    const node = state.doc.resolve(previous).nodeBefore;
++    if (!node || node.type.name !== "paragraph") break;
++    previous -= node.nodeSize;
++    const value = node.textBetween(0, node.content.size, "\n", leafText);
++    parts.unshift({ pos: previous, node, length: value.length + 1 });
++    prefix = value + "\n" + prefix;
++  }
++  const math = findLatexMath(prefix).find(
++    (match) => match.to === prefix.length,
++  );
++  if (!math) return false;
++  let offset = math.from;
++  let first = parts[0];
++  for (const part of parts) {
++    if (offset < part.length) {
++      first = part;
++      break;
++    }
++    offset -= part.length;
++  }
++  if (!math.display && first.pos !== $from.before()) return false;
++  const start = first.pos + 1 + offset;
++  let protectedContent = false;
++  state.doc.nodesBetween(start, to, (node) => {
++    if (
++      (node.isInline && !node.isText && node.type.name !== "hardBreak") ||
++      node.marks.some(
++        (mark) => mark.type.name === "code" || mark.type.name === "link",
++      )
++    )
++      protectedContent = true;
++  });
++  if (protectedContent) return false;
++  const type =
++    state.schema.nodes[math.display ? "math_display" : "math_inline"];
++  if (!type) return false;
++  const formula = type.create(null, state.schema.text(math.tex));
++  const tr = state.tr;
++  if (math.display) {
++    const paragraph = first.node;
++    const before = paragraph.content.cut(0, offset);
++    const after = $to.parent.content.cut($to.parentOffset);
++    const nodes = [];
++    if (before.size) nodes.push(paragraph.copy(before));
++    nodes.push(formula);
++    // Leave an editable paragraph after the display formula.
++    nodes.push($to.parent.copy(after));
++    tr.replaceWith(first.pos, $from.after(), nodes);
++    const cursor =
++      first.pos + (before.size ? before.size + 2 : 0) + formula.nodeSize + 1;
++    const Selection = state.selection.constructor as typeof TextSelection;
++    tr.setSelection(Selection.near(tr.doc.resolve(cursor)));
++  } else {
++    tr.replaceWith(start, to, formula);
++    const Selection = state.selection.constructor as typeof TextSelection;
++    tr.setSelection(Selection.near(tr.doc.resolve(start + formula.nodeSize)));
++  }
++  view.dispatch(tr.scrollIntoView());
++  return true;
++}
++
++export function initLatexInputPlugin(plugins: readonly Plugin[]) {
++  const plugin = new Plugin({
++    key: new PluginKey("betterNotesLatexInput"),
++    props: { handleTextInput: handleLatexInput },
++  });
++  (plugin.spec as any).betterNotes = "latexInput";
++  // Run before built-in input handlers.
++  return [plugin, ...plugins];
++}
+--- /dev/null
++++ b/src/extras/shared/latexMath.ts
+@@ -0,0 +1,194 @@
++/** LaTeX math boundaries accepted in addition to Markdown's dollar delimiters. */
++export interface LatexMath {
++  from: number;
++  to: number;
++  tex: string;
++  display: boolean;
++}
++
++function escaped(text: string, at: number) {
++  let slashes = 0;
++  while (at > 0 && text[--at] === "\\") slashes++;
++  return slashes % 2 === 1;
++}
++
++/** Keep code, existing dollar math and HTML tags literal. Unclosed math stays text. */
++export function findLatexMath(text: string): LatexMath[] {
++  const matches: LatexMath[] = [];
++  let i = 0;
++  while (i < text.length) {
++    if (escaped(text, i)) {
++      i++;
++      continue;
++    }
++    // Fenced code (including an unfinished fence) and inline code spans.
++    if (text[i] === "`" || text[i] === "~") {
++      const run = text.slice(i).match(/^(`+|~+)/)![0];
++      const lineStart = text.lastIndexOf("\n", i - 1) + 1;
++      const isFence =
++        run.length >= 3 && /^ {0,3}$/.test(text.slice(lineStart, i));
++      if (isFence) {
++        const rest = text.indexOf("\n", i + run.length);
++        const closing = new RegExp(
++          "^ {0,3}" + run[0] + "{" + run.length + ",}[ \\t]*$",
++          "m",
++        );
++        const end = rest < 0 ? null : closing.exec(text.slice(rest + 1));
++        i = end ? rest + 1 + end.index + end[0].length : text.length;
++        continue;
++      }
++      if (run[0] === "`") {
++        let end = i + run.length;
++        while ((end = text.indexOf(run, end)) !== -1) {
++          if (text[end - 1] !== "`" && text[end + run.length] !== "`") break;
++          end += run.length;
++        }
++        if (end !== -1) {
++          i = end + run.length;
++          continue;
++        }
++      }
++      i += run.length;
++      continue;
++    }
++    // Indented Markdown code.
++    if ((i === 0 || text[i - 1] === "\n") && /^( {4}|\t)/.test(text.slice(i))) {
++      const end = text.indexOf("\n", i);
++      i = end < 0 ? text.length : end + 1;
++      continue;
++    }
++    if (text[i] === "<") {
++      const tag = text.slice(i).match(/^<!--[\s\S]*?-->|^<\/?[A-Za-z][^>]*>/);
++      if (tag) {
++        const literal = tag[0].match(/^<(pre|code|script|style|textarea)\b/i);
++        if (literal) {
++          const close = new RegExp(`</${literal[1]}\\s*>`, "i").exec(
++            text.slice(i + tag[0].length),
++          );
++          i = close
++            ? i + tag[0].length + close.index + close[0].length
++            : text.length;
++          continue;
++        }
++        i += tag[0].length;
++        continue;
++      }
++    }
++    // Do not interpret LaTeX boundaries within an existing dollar formula.
++    if (text[i] === "$") {
++      const boundary = text[i + 1] === "$" ? "$$" : "$";
++      let end = i + boundary.length;
++      while ((end = text.indexOf(boundary, end)) !== -1 && escaped(text, end))
++        end++;
++      if (end !== -1) {
++        i = end + boundary.length;
++        continue;
++      }
++    }
++    // Markdown link destinations are not prose.
++    if (text.startsWith("](", i)) {
++      let depth = 1,
++        end = i + 2;
++      for (; end < text.length && depth; end++) {
++        if (escaped(text, end)) continue;
++        if (text[end] === "(") depth++;
++        if (text[end] === ")") depth--;
++      }
++      if (!depth) {
++        i = end;
++        continue;
++      }
++    }
++    const opener = text.slice(i, i + 2);
++    const environment = text
++      .slice(i)
++      .match(/^\\begin\{(equation\*?|align\*?|gather\*?|displaymath)\}/);
++    if (opener !== "\\(" && opener !== "\\[" && !environment) {
++      i++;
++      continue;
++    }
++    const display = opener === "\\[" || !!environment;
++    const openingLength = environment ? environment[0].length : 2;
++    const closer = environment
++      ? `\\end{${environment[1]}}`
++      : display
++        ? "\\]"
++        : "\\)";
++    let end = i + openingLength;
++    while ((end = text.indexOf(closer, end)) !== -1 && escaped(text, end))
++      end += 2;
++    if (end < 0) {
++      i += openingLength;
++      continue;
++    }
++    let tex = text.slice(i + openingLength, end).trim();
++    if (environment && tex) {
++      // KaTeX has no document-wide label/number registry. Preserve the math,
++      // using its nested alignment environments instead of LaTeX display ones.
++      tex = tex
++        .replace(/\\label\{[^{}]*\}/g, "")
++        .replace(/\\(?:nonumber|notag)\b/g, "")
++        .trim();
++      const name = environment[1].replace(/\*$/, "");
++      if (name === "align" || name === "gather") {
++        const inner = name === "align" ? "aligned" : "gathered";
++        tex = `\\begin{${inner}}\n${tex}\n\\end{${inner}}`;
++      }
++    }
++    if (tex && !tex.includes("\ufffc"))
++      matches.push({ from: i, to: end + closer.length, tex, display });
++    i = end + closer.length;
++  }
++  return matches;
++}
++
++/** Run before remark consumes backslash escapes. Display boundaries need newlines. */
++export function normalizeLatexMath(text: string): string {
++  const matches = findLatexMath(text);
++  for (const math of matches.reverse()) {
++    const value = math.display
++      ? `\n\n$$\n${math.tex}\n$$\n\n`
++      : `$${math.tex}$`;
++    text = text.slice(0, math.from) + value + text.slice(math.to);
++  }
++  return text;
++}
++
++/** Rich clipboard content must be changed as DOM text, never by replacing HTML. */
++export function convertLatexHTML(html: string, parser: DOMParser): string {
++  const doc = parser.parseFromString(html, "text/html");
++  const walk = (parent: Node) => {
++    for (const node of Array.from(parent.childNodes)) {
++      if (!node) continue;
++      if (node.nodeType === 1) {
++        const el = node as Element;
++        if (
++          el.matches(
++            "pre, code, kbd, samp, script, style, a, .math, .katex, [data-annotation], [data-citation]",
++          )
++        )
++          continue;
++        walk(node);
++      } else if (node.nodeType === 3) {
++        const text = node.textContent || "";
++        const matches = findLatexMath(text);
++        if (!matches.length) continue;
++        const fragment = doc.createDocumentFragment();
++        let from = 0;
++        for (const math of matches) {
++          fragment.appendChild(doc.createTextNode(text.slice(from, math.from)));
++          const formula = doc.createElement(math.display ? "pre" : "span");
++          formula.className = "math";
++          const delimiter = math.display ? "$$" : "$";
++          formula.textContent = delimiter + math.tex + delimiter;
++          fragment.appendChild(formula);
++          from = math.to;
++        }
++        fragment.appendChild(doc.createTextNode(text.slice(from)));
++        parent.replaceChild(fragment, node);
++      }
++    }
++  };
++  walk(doc.body);
++  return doc.body.innerHTML;
++}
+--- /dev/null
++++ b/local-tests/package.json
+@@ -0,0 +1 @@
++{"private":true,"type":"module","devDependencies":{"jsdom":"26.1.0"},"scripts":{"test":"node --test latex.test.mjs"}}
+--- /dev/null
++++ b/local-tests/package-lock.json
+@@ -0,0 +1,542 @@
++{
++  "name": "local-tests",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "devDependencies": {
++        "jsdom": "26.1.0"
++      }
++    },
++    "node_modules/@asamuzakjp/css-color": {
++      "version": "3.2.0",
++      "resolved": "https://registry.npmjs.org/@asamuzakjp/css-color/-/css-color-3.2.0.tgz",
++      "integrity": "sha512-K1A6z8tS3XsmCMM86xoWdn7Fkdn9m6RSVtocUrJYIwZnFVkng/PvkEoWtOWmP+Scc6saYWHWZYbndEEXxl24jw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@csstools/css-calc": "^2.1.3",
++        "@csstools/css-color-parser": "^3.0.9",
++        "@csstools/css-parser-algorithms": "^3.0.4",
++        "@csstools/css-tokenizer": "^3.0.3",
++        "lru-cache": "^10.4.3"
++      }
++    },
++    "node_modules/@csstools/color-helpers": {
++      "version": "5.1.0",
++      "resolved": "https://registry.npmjs.org/@csstools/color-helpers/-/color-helpers-5.1.0.tgz",
++      "integrity": "sha512-S11EXWJyy0Mz5SYvRmY8nJYTFFd1LCNV+7cXyAgQtOOuzb4EsgfqDufL+9esx72/eLhsRdGZwaldu/h+E4t4BA==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT-0",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@csstools/css-calc": {
++      "version": "2.1.4",
++      "resolved": "https://registry.npmjs.org/@csstools/css-calc/-/css-calc-2.1.4.tgz",
++      "integrity": "sha512-3N8oaj+0juUw/1H3YwmDDJXCgTB1gKU6Hc/bB502u9zR0q2vd786XJH9QfrKIEgFlZmhZiq6epXl4rHqhzsIgQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@csstools/css-parser-algorithms": "^3.0.5",
++        "@csstools/css-tokenizer": "^3.0.4"
++      }
++    },
++    "node_modules/@csstools/css-color-parser": {
++      "version": "3.1.0",
++      "resolved": "https://registry.npmjs.org/@csstools/css-color-parser/-/css-color-parser-3.1.0.tgz",
++      "integrity": "sha512-nbtKwh3a6xNVIp/VRuXV64yTKnb1IjTAEEh3irzS+HkKjAOYLTGNb9pmVNntZ8iVBHcWDA2Dof0QtPgFI1BaTA==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "@csstools/color-helpers": "^5.1.0",
++        "@csstools/css-calc": "^2.1.4"
++      },
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@csstools/css-parser-algorithms": "^3.0.5",
++        "@csstools/css-tokenizer": "^3.0.4"
++      }
++    },
++    "node_modules/@csstools/css-parser-algorithms": {
++      "version": "3.0.5",
++      "resolved": "https://registry.npmjs.org/@csstools/css-parser-algorithms/-/css-parser-algorithms-3.0.5.tgz",
++      "integrity": "sha512-DaDeUkXZKjdGhgYaHNJTV9pV7Y9B3b644jCLs9Upc3VeNGg6LWARAT6O+Q+/COo+2gg/bM5rhpMAtf70WqfBdQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@csstools/css-tokenizer": "^3.0.4"
++      }
++    },
++    "node_modules/@csstools/css-tokenizer": {
++      "version": "3.0.4",
++      "resolved": "https://registry.npmjs.org/@csstools/css-tokenizer/-/css-tokenizer-3.0.4.tgz",
++      "integrity": "sha512-Vd/9EVDiu6PPJt9yAh6roZP6El1xHrdvIVGjyBsHR0RYwNHgL7FJPyIIW4fANJNG6FtyZfvlRPpFI4ZM/lubvw==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/csstools"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/csstools"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/agent-base": {
++      "version": "7.1.4",
++      "resolved": "https://registry.npmjs.org/agent-base/-/agent-base-7.1.4.tgz",
++      "integrity": "sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/cssstyle": {
++      "version": "4.6.0",
++      "resolved": "https://registry.npmjs.org/cssstyle/-/cssstyle-4.6.0.tgz",
++      "integrity": "sha512-2z+rWdzbbSZv6/rhtvzvqeZQHrBaqgogqt85sqFNbabZOuFbCVFb8kPeEtZjiKkbrm395irpNKiYeFeLiQnFPg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@asamuzakjp/css-color": "^3.2.0",
++        "rrweb-cssom": "^0.8.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/data-urls": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/data-urls/-/data-urls-5.0.0.tgz",
++      "integrity": "sha512-ZYP5VBHshaDAiVZxjbRVcFJpc+4xGgT0bK3vzy1HLN8jTO975HEbuYzZJcHoQEY5K1a0z8YayJkyVETa08eNTg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "whatwg-mimetype": "^4.0.0",
++        "whatwg-url": "^14.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/debug": {
++      "version": "4.4.3",
++      "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
++      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "ms": "^2.1.3"
++      },
++      "engines": {
++        "node": ">=6.0"
++      },
++      "peerDependenciesMeta": {
++        "supports-color": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/decimal.js": {
++      "version": "10.6.0",
++      "resolved": "https://registry.npmjs.org/decimal.js/-/decimal.js-10.6.0.tgz",
++      "integrity": "sha512-YpgQiITW3JXGntzdUmyUR1V812Hn8T1YVXhCu+wO3OpS4eU9l4YdD3qjyiKdV6mvV29zapkMeD390UVEf2lkUg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/entities": {
++      "version": "6.0.1",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-6.0.1.tgz",
++      "integrity": "sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
++    "node_modules/html-encoding-sniffer": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/html-encoding-sniffer/-/html-encoding-sniffer-4.0.0.tgz",
++      "integrity": "sha512-Y22oTqIU4uuPgEemfz7NDJz6OeKf12Lsu+QC+s3BVpda64lTiMYCyGwg5ki4vFxkMwQdeZDl2adZoqUgdFuTgQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "whatwg-encoding": "^3.1.1"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/http-proxy-agent": {
++      "version": "7.0.2",
++      "resolved": "https://registry.npmjs.org/http-proxy-agent/-/http-proxy-agent-7.0.2.tgz",
++      "integrity": "sha512-T1gkAiYYDWYx3V5Bmyu7HcfcvL7mUrTWiM6yOfa3PIphViJ/gFPbvidQ+veqSOHci/PxBcDabeUNCzpOODJZig==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.0",
++        "debug": "^4.3.4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/https-proxy-agent": {
++      "version": "7.0.6",
++      "resolved": "https://registry.npmjs.org/https-proxy-agent/-/https-proxy-agent-7.0.6.tgz",
++      "integrity": "sha512-vK9P5/iUfdl95AI+JVyUuIcVtd4ofvtrOr3HNtM2yxC9bnMbEdp3x01OhQNnjb8IJYi38VlTE3mBXwcfvywuSw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.2",
++        "debug": "4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/iconv-lite": {
++      "version": "0.6.3",
++      "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.6.3.tgz",
++      "integrity": "sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "safer-buffer": ">= 2.1.2 < 3.0.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/is-potential-custom-element-name": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/is-potential-custom-element-name/-/is-potential-custom-element-name-1.0.1.tgz",
++      "integrity": "sha512-bCYeRA2rVibKZd+s2625gGnGF/t7DSqDs4dP7CrLA1m7jKWz6pps0LpYLJN8Q64HtmPKJ1hrN3nzPNKFEKOUiQ==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/jsdom": {
++      "version": "26.1.0",
++      "resolved": "https://registry.npmjs.org/jsdom/-/jsdom-26.1.0.tgz",
++      "integrity": "sha512-Cvc9WUhxSMEo4McES3P7oK3QaXldCfNWp7pl2NNeiIFlCoLr3kfq9kb1fxftiwk1FLV7CvpvDfonxtzUDeSOPg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "cssstyle": "^4.2.1",
++        "data-urls": "^5.0.0",
++        "decimal.js": "^10.5.0",
++        "html-encoding-sniffer": "^4.0.0",
++        "http-proxy-agent": "^7.0.2",
++        "https-proxy-agent": "^7.0.6",
++        "is-potential-custom-element-name": "^1.0.1",
++        "nwsapi": "^2.2.16",
++        "parse5": "^7.2.1",
++        "rrweb-cssom": "^0.8.0",
++        "saxes": "^6.0.0",
++        "symbol-tree": "^3.2.4",
++        "tough-cookie": "^5.1.1",
++        "w3c-xmlserializer": "^5.0.0",
++        "webidl-conversions": "^7.0.0",
++        "whatwg-encoding": "^3.1.1",
++        "whatwg-mimetype": "^4.0.0",
++        "whatwg-url": "^14.1.1",
++        "ws": "^8.18.0",
++        "xml-name-validator": "^5.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "canvas": "^3.0.0"
++      },
++      "peerDependenciesMeta": {
++        "canvas": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/lru-cache": {
++      "version": "10.4.3",
++      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-10.4.3.tgz",
++      "integrity": "sha512-JNAzZcXrCt42VGLuYz0zfAzDfAvJWW6AfYlDBQyDV5DClI2m5sAmK+OIO7s59XfsRsWHp02jAJrRadPRGTt6SQ==",
++      "dev": true,
++      "license": "ISC"
++    },
++    "node_modules/ms": {
++      "version": "2.1.3",
++      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
++      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/nwsapi": {
++      "version": "2.2.28",
++      "resolved": "https://registry.npmjs.org/nwsapi/-/nwsapi-2.2.28.tgz",
++      "integrity": "sha512-IlVB7OS7qrOsVYlpnFIkETjMwT9jwvmocJmmM+GZU/PAB3uGi9Ezd7vcWhWBUnSc0ya4ppmQITOyP1ez9gg8cg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/parse5": {
++      "version": "7.3.0",
++      "resolved": "https://registry.npmjs.org/parse5/-/parse5-7.3.0.tgz",
++      "integrity": "sha512-IInvU7fabl34qmi9gY8XOVxhYyMyuH2xUNpb2q8/Y+7552KlejkRvqvD19nMoUW/uQGGbqNpA6Tufu5FL5BZgw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "entities": "^6.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/inikulin/parse5?sponsor=1"
++      }
++    },
++    "node_modules/punycode": {
++      "version": "2.3.1",
++      "resolved": "https://registry.npmjs.org/punycode/-/punycode-2.3.1.tgz",
++      "integrity": "sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
++    "node_modules/rrweb-cssom": {
++      "version": "0.8.0",
++      "resolved": "https://registry.npmjs.org/rrweb-cssom/-/rrweb-cssom-0.8.0.tgz",
++      "integrity": "sha512-guoltQEx+9aMf2gDZ0s62EcV8lsXR+0w8915TC3ITdn2YueuNjdAYh/levpU9nFaoChh9RUS5ZdQMrKfVEN9tw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/safer-buffer": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/safer-buffer/-/safer-buffer-2.1.2.tgz",
++      "integrity": "sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/saxes": {
++      "version": "6.0.0",
++      "resolved": "https://registry.npmjs.org/saxes/-/saxes-6.0.0.tgz",
++      "integrity": "sha512-xAg7SOnEhrm5zI3puOOKyy1OMcMlIJZYNJY7xLBwSze0UjhPLnWfj2GF2EpT0jmzaJKIWKHLsaSSajf35bcYnA==",
++      "dev": true,
++      "license": "ISC",
++      "dependencies": {
++        "xmlchars": "^2.2.0"
++      },
++      "engines": {
++        "node": ">=v12.22.7"
++      }
++    },
++    "node_modules/symbol-tree": {
++      "version": "3.2.4",
++      "resolved": "https://registry.npmjs.org/symbol-tree/-/symbol-tree-3.2.4.tgz",
++      "integrity": "sha512-9QNk5KwDF+Bvz+PyObkmSYjI5ksVUYtjW7AU22r2NKcfLJcXp96hkDWU3+XndOsUb+AQ9QhfzfCT2O+CNWT5Tw==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/tldts": {
++      "version": "6.1.86",
++      "resolved": "https://registry.npmjs.org/tldts/-/tldts-6.1.86.tgz",
++      "integrity": "sha512-WMi/OQ2axVTf/ykqCQgXiIct+mSQDFdH2fkwhPwgEwvJ1kSzZRiinb0zF2Xb8u4+OqPChmyI6MEu4EezNJz+FQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "tldts-core": "^6.1.86"
++      },
++      "bin": {
++        "tldts": "bin/cli.js"
++      }
++    },
++    "node_modules/tldts-core": {
++      "version": "6.1.86",
++      "resolved": "https://registry.npmjs.org/tldts-core/-/tldts-core-6.1.86.tgz",
++      "integrity": "sha512-Je6p7pkk+KMzMv2XXKmAE3McmolOQFdxkKw0R8EYNr7sELW46JqnNeTX8ybPiQgvg1ymCoF8LXs5fzFaZvJPTA==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/tough-cookie": {
++      "version": "5.1.2",
++      "resolved": "https://registry.npmjs.org/tough-cookie/-/tough-cookie-5.1.2.tgz",
++      "integrity": "sha512-FVDYdxtnj0G6Qm/DhNPSb8Ju59ULcup3tuJxkFb5K8Bv2pUXILbf0xZWU8PX8Ov19OXljbUyveOFwRMwkXzO+A==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "tldts": "^6.1.32"
++      },
++      "engines": {
++        "node": ">=16"
++      }
++    },
++    "node_modules/tr46": {
++      "version": "5.1.1",
++      "resolved": "https://registry.npmjs.org/tr46/-/tr46-5.1.1.tgz",
++      "integrity": "sha512-hdF5ZgjTqgAntKkklYw0R03MG2x/bSzTtkxmIRw/sTNV8YXsCJ1tfLAX23lhxhHJlEf3CRCOCGGWw3vI3GaSPw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "punycode": "^2.3.1"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/w3c-xmlserializer": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/w3c-xmlserializer/-/w3c-xmlserializer-5.0.0.tgz",
++      "integrity": "sha512-o8qghlI8NZHU1lLPrpi2+Uq7abh4GGPpYANlalzWxyWteJOCsr/P+oPBA49TOLu5FTZO4d3F9MnWJfiMo4BkmA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "xml-name-validator": "^5.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/webidl-conversions": {
++      "version": "7.0.0",
++      "resolved": "https://registry.npmjs.org/webidl-conversions/-/webidl-conversions-7.0.0.tgz",
++      "integrity": "sha512-VwddBukDzu71offAQR975unBIGqfKZpM+8ZX6ySk8nYhVoo5CYaZyzt3YBvYtRtO+aoGlqxPg/B87NGVZ/fu6g==",
++      "dev": true,
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=12"
++      }
++    },
++    "node_modules/whatwg-encoding": {
++      "version": "3.1.1",
++      "resolved": "https://registry.npmjs.org/whatwg-encoding/-/whatwg-encoding-3.1.1.tgz",
++      "integrity": "sha512-6qN4hJdMwfYBtE3YBTTHhoeuUrDBPZmbQaxWAqSALV/MeEnR5z1xd8UKud2RAkFoPkmB+hli1TZSnyi84xz1vQ==",
++      "deprecated": "Use @exodus/bytes instead for a more spec-conformant and faster implementation",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "iconv-lite": "0.6.3"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/whatwg-mimetype": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/whatwg-mimetype/-/whatwg-mimetype-4.0.0.tgz",
++      "integrity": "sha512-QaKxh0eNIi2mE9p2vEdzfagOKHCcj1pJ56EEHGQOVxp8r9/iszLUUV7v89x9O1p/T+NlTM5W7jW6+cz4Fq1YVg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/whatwg-url": {
++      "version": "14.2.0",
++      "resolved": "https://registry.npmjs.org/whatwg-url/-/whatwg-url-14.2.0.tgz",
++      "integrity": "sha512-De72GdQZzNTUBBChsXueQUnPKDkg/5A5zp7pFDuQAj5UFoENpiACU0wlCvzpAGnTkj++ihpKwKyYewn/XNUbKw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "tr46": "^5.1.0",
++        "webidl-conversions": "^7.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/ws": {
++      "version": "8.22.0",
++      "resolved": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
++      "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=10.0.0"
++      },
++      "peerDependencies": {
++        "bufferutil": "^4.0.1",
++        "utf-8-validate": ">=5.0.2"
++      },
++      "peerDependenciesMeta": {
++        "bufferutil": {
++          "optional": true
++        },
++        "utf-8-validate": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/xml-name-validator": {
++      "version": "5.0.0",
++      "resolved": "https://registry.npmjs.org/xml-name-validator/-/xml-name-validator-5.0.0.tgz",
++      "integrity": "sha512-EvGK8EJ3DhaHfbRlETOWAS5pO9MZITeauHKJyb8wyajUfQUenkIg2MvLDTZ4T/TgIcm3HU0TFBgWWboAZ30UHg==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/xmlchars": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/xmlchars/-/xmlchars-2.2.0.tgz",
++      "integrity": "sha512-JZnDKK8B0RCDw84FNdDAIpZK+JuJw+s7Lz8nksI7SIuU3UXJJslUthsi+uWBUYOwPFwW7W7PRLRfUKpxjtjFCw==",
++      "dev": true,
++      "license": "MIT"
++    }
++  }
++}
+--- /dev/null
++++ b/local-tests/latex.test.mjs
+@@ -0,0 +1,265 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { build } from "esbuild";
++import { JSDOM } from "jsdom";
++import { Schema, Fragment, DOMParser as PMParser } from "prosemirror-model";
++import { EditorState, TextSelection } from "prosemirror-state";
++import katex from "katex";
++
++await build({
++  entryPoints: [
++    "src/extras/shared/latexMath.ts",
++    "src/extras/editor/latexInput.ts",
++    "src/extras/convert.ts",
++  ],
++  outdir: "local-tests/build",
++  bundle: true,
++  platform: "node",
++  format: "esm",
++  packages: "external",
++});
++const { findLatexMath, normalizeLatexMath, convertLatexHTML } = await import(
++  "./build/shared/latexMath.js"
++);
++const { handleLatexInput } = await import("./build/editor/latexInput.js");
++const { md2html } = await import("./build/convert.js");
++const dom = new JSDOM("");
++globalThis.DOMParser = dom.window.DOMParser;
++const schema = new Schema({
++  nodes: {
++    doc: { content: "block+" },
++    paragraph: {
++      group: "block",
++      content: "inline*",
++      parseDOM: [{ tag: "p" }],
++      toDOM: () => ["p", 0],
++    },
++    text: { group: "inline" },
++    hardBreak: {
++      inline: true,
++      group: "inline",
++      parseDOM: [{ tag: "br" }],
++      toDOM: () => ["br"],
++    },
++    math_inline: {
++      group: "inline math",
++      content: "text*",
++      marks: "",
++      inline: true,
++      atom: true,
++      parseDOM: [
++        {
++          tag: "span.math",
++          getContent: (e, s) =>
++            Fragment.from(s.text(e.textContent.trim().slice(1, -1))),
++        },
++      ],
++      toDOM: (n) => ["span", { class: "math" }, "$" + n.textContent + "$"],
++    },
++    math_display: {
++      group: "block math",
++      content: "text*",
++      atom: true,
++      code: true,
++      parseDOM: [
++        {
++          tag: "pre.math",
++          getContent: (e, s) =>
++            Fragment.from(s.text(e.textContent.trim().slice(2, -2))),
++        },
++      ],
++      toDOM: (n) => ["pre", { class: "math" }, "$$" + n.textContent + "$$"],
++    },
++    codeBlock: {
++      group: "block",
++      content: "text*",
++      code: true,
++      parseDOM: [{ tag: "pre" }],
++      toDOM: () => ["pre", 0],
++    },
++    bulletList: { group: "block", content: "listItem+" },
++    listItem: { content: "block+" },
++  },
++  marks: {
++    code: { code: true, toDOM: () => ["code", 0] },
++    link: {
++      attrs: { href: {} },
++      toDOM: (m) => ["a", { href: m.attrs.href }, 0],
++    },
++  },
++});
++const r = String.raw;
++function formulas(doc) {
++  const out = [];
++  doc.descendants((n) => {
++    if (n.type.name.startsWith("math_")) out.push([n.type.name, n.textContent]);
++  });
++  return out;
++}
++function parse(html) {
++  const el = dom.window.document.createElement("div");
++  el.innerHTML = html;
++  return PMParser.fromSchema(schema).parse(el);
++}
++function input(paragraphs, last, opts = {}) {
++  const ps = paragraphs.map((text) =>
++    schema.node(
++      opts.codeBlock ? "codeBlock" : "paragraph",
++      null,
++      text ? schema.text(text, opts.code ? [schema.mark("code")] : []) : null,
++    ),
++  );
++  const doc = opts.list
++    ? schema.node("doc", null, [
++        schema.node("bulletList", null, [schema.node("listItem", null, ps)]),
++      ])
++    : schema.node("doc", null, ps);
++  const cursor = doc.content.size - (opts.list ? 3 : 1);
++  let state = EditorState.create({
++    doc,
++    selection: TextSelection.create(doc, cursor),
++  });
++  const view = {
++    get state() {
++      return state;
++    },
++    composing: !!opts.composing,
++    dispatch(tr) {
++      state = state.apply(tr);
++    },
++  };
++  const handled = handleLatexInput(view, cursor, cursor, last);
++  return { handled, state };
++}
++
++test("screenshot formula becomes a native display formula", async () => {
++  const source = r`\[\boxed{\text{proprioception + object xyz + ego depth}}\]`;
++  const result = parse(await md2html(source));
++  assert.deepEqual(formulas(result), [
++    ["math_display", r`\boxed{\text{proprioception + object xyz + ego depth}}`],
++  ]);
++  katex.renderToString(formulas(result)[0][1], {
++    throwOnError: true,
++    displayMode: true,
++  });
++});
++test("mixed Chinese prose, inline math and display math", async () => {
++  const doc = parse(await md2html(r`前面 \(x^2\) 中间 \[\frac{a}{b}\] 后面`));
++  assert.equal(formulas(doc).length, 2);
++  assert.ok(doc.textContent.includes("前面"));
++  assert.ok(doc.textContent.includes("后面"));
++});
++test("equation and align environments render with KaTeX", async () => {
++  for (const env of [
++    "equation",
++    "equation*",
++    "align",
++    "align*",
++    "gather",
++    "gather*",
++  ]) {
++    const body = env.startsWith("align") ? r`a &= b \\ c &= d` : r`E=mc^2`;
++    const source = `\\begin{${env}}\n${body}\\label{eq:test}\n\\end{${env}}`;
++    const doc = parse(await md2html(source));
++    const fs = formulas(doc);
++    assert.equal(fs.length, 1, env);
++    katex.renderToString(fs[0][1], { throwOnError: true, displayMode: true });
++  }
++});
++test("code, incomplete delimiters, escaped delimiters, dollar math and link URLs remain literal", () => {
++  for (const source of [
++    r`\(unfinished`,
++    r`\\[x\\]`,
++    "`" + r`\(x\)` + "`",
++    "```latex\n" + r`\[x\]` + "\n```",
++    "~~~tex\n" + r`\[x\]` + "\n~~~",
++    "```\n" + r`\[x\]`,
++    "    " + r`\(x\)`,
++    "<pre>" + r`\[x\]` + "</pre>",
++    r`$\text{\(x\)}$`,
++    r`[link](https://example.org/\(x\))`,
++  ])
++    assert.equal(normalizeLatexMath(source), source, source);
++});
++test("two displays and multiline alignment preserve ordering", async () => {
++  const doc = parse(await md2html(r`\[a\] and \[b\]`));
++  assert.equal(formulas(doc).length, 2);
++});
++test("HTML clipboard preserves formatting, code, attributes and literal angle brackets", async () => {
++  const html =
++    "<p><b>说明</b> " +
++    r`\(x&lt;y\)` +
++    "</p><pre>" +
++    r`\[code\]` +
++    '</pre><a href="https://example.org/">' +
++    r`\(link\)` +
++    "</a>";
++  const out = convertLatexHTML(html, new DOMParser());
++  assert.ok(out.includes("<b>说明</b>"));
++  assert.ok(out.includes("x&lt;y"));
++  assert.ok(out.includes(r`\[code\]`));
++  assert.ok(out.includes(r`\(link\)`));
++  const doc = parse(await md2html(out));
++  assert.equal(formulas(doc).length, 1);
++});
++test("HTML display math is lifted out of a paragraph without losing surrounding text", async () => {
++  const out = convertLatexHTML(
++    "<p>before " + r`\[x^2\]` + " after</p>",
++    new DOMParser(),
++  );
++  const doc = parse(await md2html(out));
++  assert.equal(formulas(doc).length, 1);
++  assert.ok(doc.textContent.includes("before"));
++  assert.ok(doc.textContent.includes("after"));
++});
++test("typing inline closing delimiter creates a formula and leaves cursor after it", () => {
++  const { handled, state } = input([r`中文 \(x^2` + "\\"], ")");
++  assert.equal(handled, true);
++  assert.deepEqual(formulas(state.doc), [["math_inline", "x^2"]]);
++  assert.equal(state.selection.$from.parent.type.name, "paragraph");
++});
++test("typing a display closing delimiter creates an editable following paragraph", () => {
++  const { handled, state } = input([r`before \[x^2` + "\\"], "]");
++  assert.equal(handled, true);
++  assert.deepEqual(formulas(state.doc), [["math_display", "x^2"]]);
++  assert.equal(state.doc.lastChild.type.name, "paragraph");
++  assert.equal(state.selection.$from.parent.type.name, "paragraph");
++});
++test("typing multiline align closing environment works across paragraphs", () => {
++  const { handled, state } = input(
++    [r`\begin{align}`, r`a &= b \\`, r`c &= d`, r`\end{align`],
++    "}",
++  );
++  assert.equal(handled, true);
++  const fs = formulas(state.doc);
++  assert.equal(fs.length, 1);
++  katex.renderToString(fs[0][1], { throwOnError: true, displayMode: true });
++});
++test("typing display math in a list keeps the list structure", () => {
++  const { handled, state } = input([r`\[x` + "\\"], "]", { list: true });
++  assert.equal(handled, true);
++  assert.equal(state.doc.firstChild.type.name, "bulletList");
++  assert.equal(formulas(state.doc).length, 1);
++});
++test("typing in code or during composition never converts", () => {
++  for (const opts of [{ code: true }, { codeBlock: true }, { composing: true }])
++    assert.equal(input([r`\(x` + "\\"], ")", opts).handled, false);
++});
++test("unclosed and escaped typing delimiters remain plain text", () => {
++  assert.equal(input([r`\\(x` + "\\"], ")").handled, false);
++  assert.equal(input(["normal text"], ")").handled, false);
++});
++
++test('browser bundle pastes a standalone display formula without unwrapping it', async () => {
++  const script = await build({entryPoints:['src/extras/editorScript.ts'],bundle:true,platform:'browser',format:'iife',write:false});
++  const browser = new JSDOM('<!doctype html><html><body></body></html>',{runScripts:'outside-only'});
++  browser.window.eval(script.outputFiles[0].text);
++  for (const html of ['<pre class="math">$$x^2$$</pre>','<p><span class="math">$x^2$</span></p>']) {
++    const doc = schema.node('doc',null,[schema.node('paragraph')]);
++    const state = EditorState.create({doc});
++    const slice = browser.window.BetterNotesEditorAPI.getSliceFromHTML(state,html);
++    const next = state.apply(state.tr.replaceSelection(slice));
++    assert.equal(formulas(next.doc).length,1);
++    assert.equal(formulas(next.doc)[0][1],'x^2');
++  }
++});
+--- /dev/null
++++ b/local-tests/runtime-bootstrap.js
+@@ -0,0 +1,61 @@
++function install() {}
++function uninstall() {}
++function shutdown() {}
++function onMainWindowLoad() {}
++function onMainWindowUnload() {}
++function startup() { runTests(); }
++async function runTests() {
++ const report={passed:[],errors:[],console:[]};
++ const listener={observe(m){if(/error|exception|latex|TypeError|ReferenceError/i.test(m.message)) report.console.push(m.message);}};Services.console.registerListener(listener);
++ const resultPath='/home/taie/zotero-better-notes/local-tests/runtime/result.json';
++ const assert=(ok,message)=>{if(!ok)throw new Error(message);};
++ const wait=async(fn,label)=>{for(let i=0;i<300;i++){if(fn())return;await Zotero.Promise.delay(100);}throw new Error('Timeout: '+label);};
++ try {
++  await Zotero.initializationPromise;
++  await wait(()=>Zotero.BetterNotes?.data.initialized,'Better Notes startup');
++  const note=new Zotero.Item('note');note.setNote('<p>LaTeX integration test</p>');await note.saveTx();
++  await Zotero.getActiveZoteroPane().selectItem(note.id);
++  await wait(()=>Zotero.BetterNotes.api.editor.getEditorInstance(note.id),'note editor');
++  const ed=Zotero.BetterNotes.api.editor.getEditorInstance(note.id);await ed._initPromise;
++  const win=ed._iframeWindow.wrappedJSObject;
++  const core=win._currentEditorInstance._editorCore;
++  await wait(()=>core.view.state.plugins.some(p=>p.spec.betterNotes==='latexInput'),'LaTeX plugin');
++  const view=core.view;
++  const formulas=()=>{const out=[];view.state.doc.descendants(n=>{if(n.type.name.startsWith('math_'))out.push({type:n.type.name,tex:n.textContent});});return out;};
++  const setContent=(html)=>{const node=win.BetterNotesEditorAPI.getNodeFromHTML(view.state,html);let tr=view.state.tr.replaceWith(0,view.state.doc.content.size,node.content);const T=view.state.selection.constructor;tr.setSelection(T.near(tr.doc.resolve(tr.doc.content.size-1)));view.dispatch(tr);};
++  const paste=async(text,html)=>{
++   setContent('<p></p>');
++   const fake={clipboardData:{types:html?['text/html','text/plain']:['text/plain'],getData:type=>type==='text/plain'?text:type==='text/html'?(html||''):''}};
++   const p=view.state.plugins.find(p=>p.spec.betterNotes==='markdownPaste');
++   assert(p,'paste plugin exists'); const event=Components.utils.cloneInto(fake, win, {cloneFunctions:true}); const handled=p.props.handlePaste(view,event,null); assert(handled,'paste handled: '+JSON.stringify({text,types:event.clipboardData.types,handled,handler:String(p.props.handlePaste).slice(0,700)}));
++   try {await wait(()=>formulas().length>0,'paste result');} catch(e){report.document=view.state.doc.toJSON();throw e;}
++   view.dispatch(view.state.tr.setSelection(view.state.selection.constructor.near(view.state.doc.resolve(0))));
++   await Zotero.Promise.delay(150);
++  };
++  const originalGetSlice=win.BetterNotesEditorAPI.getSliceFromHTML;
++ win.BetterNotesEditorAPI.getSliceFromHTML=Components.utils.exportFunction((state,html)=>{report.convertedHTML=html; const slice=originalGetSlice(state,html);report.slice=slice.toJSON();return slice;},win);
++ const samples=[String.raw`\[\boxed{\text{proprioception + object xyz + ego depth}}\]`,String.raw`中文 \(x^2\) 后文`,String.raw`\begin{equation}E=mc^2\end{equation}`,String.raw`\begin{align}a &= b \\ c &= d\end{align}`];
++  for(const source of samples){
++   await paste(source);
++   assert(formulas().length===1,'one formula: '+source);
++   assert(win.document.querySelector('.katex'),'rendered KaTeX: '+source);
++   assert(!win.document.querySelector('.katex-error'),'no KaTeX error');
++   report.passed.push({action:'paste',source,result:formulas()});
++  }
++  await paste('',String.raw`<p><b>标题</b> \[x^2\] 后文</p>`);
++  assert(view.state.doc.textContent.includes('标题') && view.state.doc.textContent.includes('后文'),'HTML surrounding text');
++  report.passed.push({action:'HTML paste',result:formulas()});
++  for(const [html,closing] of [[String.raw`<p>中文 \(x^2\</p>`,')'],[String.raw`<p>\[x^2\</p>`,']'],[String.raw`<p>\begin{align}</p><p>a &amp;= b \\</p><p>c &amp;= d</p><p>\end{align</p>`,'}']]){
++   setContent(html);const pos=view.state.selection.from;
++   const handled=view.someProp('handleTextInput',fn=>fn(view,pos,pos,closing));
++   assert(handled,'typed closing handled');assert(formulas().length===1,'typed formula');
++   await Zotero.Promise.delay(150);
++   assert(!win.document.querySelector('.katex-error'),'typed no KaTeX error');
++   report.passed.push({action:'typing',html,result:formulas(),cursorParent:view.state.selection.$from.parent.type.name});
++  }
++  ed.saveSync();await Zotero.Promise.delay(300);assert(note.getNote().includes('class="math"'),'saved native math');
++  report.passed.push({action:'save',html:note.getNote()});
++ }catch(e){report.errors.push(String(e)+'\n'+e.stack);}
++ await IOUtils.writeUTF8(resultPath,JSON.stringify(report,null,2));
++ Services.startup.quit(Components.interfaces.nsIAppStartup.eAttemptQuit);
++}
+--- /dev/null
++++ b/local-tests/prepare-runtime.py
+@@ -0,0 +1,8 @@
++import zipfile,json,pathlib,shutil
++p=pathlib.Path(__file__).resolve().parent/'runtime/profile'
++m={'manifest_version':2,'name':'Local LaTeX Integration Test','version':'1.0.2','description':'Temporary local test runner','author':'Local','applications':{'zotero':{'id':'latex-test@local.example','update_url':'https://example.invalid/updates.json','strict_min_version':'8.0','strict_max_version':'10.99.99'}}}
++with zipfile.ZipFile(p/'extensions/latex-test@local.example.xpi','w',zipfile.ZIP_DEFLATED) as z:z.writestr('manifest.json',json.dumps(m));z.write(p.parent.parent/'runtime-bootstrap.js','bootstrap.js')
++for name in ['extensions.json','addonStartup.json.lz4','compatibility.ini']:(p/name).unlink(missing_ok=True)
++shutil.rmtree(p/'startupCache',ignore_errors=True)
++(p.parent/'result.json').unlink(missing_ok=True)
++shutil.copy2(p.parents[2]/'build/better-notes-for-zotero-la-te-x.xpi',p/'extensions/Knowledge4Zotero-latex@local.example.xpi')

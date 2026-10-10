@@ -1,5 +1,40 @@
 # Better Notes for Zotero
 
+## Local LaTeX formula support
+
+This local variant is based on Better Notes v3.3.3. Its separate add-on ID is
+`Knowledge4Zotero-latex@local.example`; do not enable it alongside upstream Better
+Notes, since both use the same editor integration and preferences. Upstream
+updates must be merged and rebuilt manually.
+
+In the normal rich-text note editor, pasting plain text supports `\(...\)` and
+`\[...\]`, plus `equation`, `equation*`, `align`, `align*`, `gather`, `gather*` and
+`displaymath` environments. Enable Better Notes' enhanced Markdown paste (on by
+default). Existing dollar-delimited Markdown math remains supported. The same
+conversion is available when importing Markdown or using Markdown source mode.
+
+Typing a closing `\)`, `\]`, or supported `\end{...}` in a paragraph converts the
+completed formula into a native Zotero formula. Display formulas may span normal
+paragraph breaks. A new paragraph after the formula lets you continue typing.
+Code blocks, inline code, links and unfinished formulas are left literal.
+
+HTML clipboard input preserves surrounding formatting and converts formulas
+contained within a single text node. Formula delimiters split across styled HTML
+nodes are not yet supported; paste plain text in that case. Existing notes are
+not scanned or rewritten automatically.
+
+`align` and `gather` are rendered using KaTeX's `aligned` and `gathered`
+environments. Document-level labels and numbering controls in these LaTeX math
+environments are removed on conversion. This is formula support, not a complete
+LaTeX document compiler: macro packages, custom command definitions and cross
+references are not resolved. The original source should be kept in Overleaf when
+those document features matter.
+
+Build: `npm ci && npm run build`. Tests: `npm ci --prefix local-tests`, then
+`node --test local-tests/latex.test.mjs`. The integration harness in `local-tests/`
+uses an isolated Zotero profile and data directory, not the normal library.
+
+
 [![zotero target version](https://img.shields.io/badge/Zotero-8%2F9-green?style=flat-square&logo=zotero&logoColor=CC2936)](https://www.zotero.org)
 [![Using Zotero Plugin Template](https://img.shields.io/badge/Using-Zotero%20Plugin%20Template-blue?style=flat-square&logo=github)](https://github.com/windingwind/zotero-plugin-template)
 [![telegram group](https://img.shields.io/badge/Join%20Community-@bnzotero-blue?style=flat-square&logo=telegram)](https://t.me/boost/bnzotero)

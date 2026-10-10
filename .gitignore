@@ -7,3 +7,7 @@ zotero-cmd.json
 .DS_Store
 .env
 .scaffold
+# Local LaTeX verification artifacts
+local-tests/build/
+local-tests/runtime/
+local-tests/*.log

@@ -12,9 +12,9 @@
   "applications": {
     "zotero": {
       "id": "__addonID__",
-      "update_url": "__updateURL__",
       "strict_min_version": "8.0-beta.21",
-      "strict_max_version": "10.99.99"
+      "strict_max_version": "10.99.99",
+      "update_url": "__updateURL__"
     }
   }
 }

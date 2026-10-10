@@ -1,10 +1,10 @@
 {
   "name": "zotero-better-notes",
-  "version": "3.3.3",
+  "version": "3.3.3-latex.3",
   "description": "Everything about note management. All in Zotero.",
   "config": {
-    "addonName": "Better Notes for Zotero",
-    "addonID": "Knowledge4Zotero@windingwind.com",
+    "addonName": "Better Notes for Zotero (LaTeX)",
+    "addonID": "Knowledge4Zotero-latex@local.example",
     "addonRef": "BetterNotes",
     "prefsPrefix": "extensions.zotero.Knowledge4Zotero",
     "addonInstance": "BetterNotes",
